@@ -20,6 +20,46 @@ import {
 } from 'lucide-react';
 import { defaultQuestions, type Question } from './data/questions';
 
+// ==========================================
+// SUPABASE CONFIGURATION
+// Configure your keys here or set them in a .env file as VITE_SUPABASE_URL & VITE_SUPABASE_ANON_KEY
+// ==========================================
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || "https://xvklpcgwfaeyltqgsvch.supabase.co";
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inh2a2xwY2d3ZmFleWx0cWdzdmNoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzMjU3MzAsImV4cCI6MjA5NTkwMTczMH0.1CWtSzr6ONg-9xAAKImszuZ_Wc73fsjDxchJABKgkJg";
+
+// ==========================================
+// PROFANITY / SLANG WORD FILTER
+// Includes both English and Hinglish slang words to keep the leaderboard clean
+// ==========================================
+const BANNED_WORDS = [
+  // English slangs
+  'fuck', 'shit', 'bitch', 'asshole', 'cunt', 'dick', 'cock', 'pussy', 'bastard', 'whore', 'slut', 'faggot', 'nigger', 'retard',
+  // Hinglish / Hindi slangs
+  'chutiya', 'gandu', 'loda', 'lodu', 'bhosadi', 'bhosdike', 'madarchod', 'behenchod', 'harami', 'saala', 'chut', 'kamine', 'bsdk',
+  'mc', 'bc', 'gand', 'bhosad', 'madrchod', 'behanchod', 'kaminey', 'laund', 'lauda', 'chutiyapa', 'randi', 'saali', 'hrami',
+  'tatte', 'jhat', 'jhant', 'goti'
+];
+
+function containsProfanity(name: string): boolean {
+  const normalized = name.toLowerCase().trim();
+  if (!normalized) return false;
+  
+  // Clean special characters for safety checks
+  const cleanText = normalized.replace(/[^a-z0-9\s]/g, '');
+  const words = cleanText.split(/\s+/);
+  
+  for (const banned of BANNED_WORDS) {
+    if (banned.length <= 3) {
+      // For short keywords (like mc, bc, bsdk), check for exact word matching
+      if (words.includes(banned)) return true;
+    } else {
+      // For longer slangs, check substring matches
+      if (normalized.includes(banned)) return true;
+    }
+  }
+  return false;
+}
+
 // Helper to shuffle array locally to ensure safety
 function shuffleArray<T>(array: T[]): T[] {
   const newArray = [...array];
@@ -30,11 +70,22 @@ function shuffleArray<T>(array: T[]): T[] {
   return newArray;
 }
 
+interface LeaderboardRecord {
+  id: number;
+  name: string;
+  score_percentage: number;
+  correct_count: number;
+  total_count: number;
+  topics: string[];
+  order_mode: string;
+  created_at: string;
+}
+
 function App() {
-  // SPA Custom Router Path state ('/' | '/start-quiz' | '/quiz')
+  // SPA Custom Router Path state ('/' | '/start-quiz' | '/quiz' | '/twi')
   const [path, setPath] = useState<string>(() => {
     const currentPath = window.location.pathname;
-    if (['/', '/start-quiz', '/quiz'].includes(currentPath)) {
+    if (['/', '/start-quiz', '/quiz', '/twi'].includes(currentPath)) {
       return currentPath;
     }
     return '/';
@@ -57,6 +108,11 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(true);
   const [showQuitModal, setShowQuitModal] = useState<boolean>(false);
   const [showFinishModal, setShowFinishModal] = useState<boolean>(false);
+
+  // Leaderboard state
+  const [leaderboard, setLeaderboard] = useState<LeaderboardRecord[]>([]);
+  const [isLeaderboardLoading, setIsLeaderboardLoading] = useState<boolean>(false);
+  const [leaderboardError, setLeaderboardError] = useState<string>('');
 
   // Configuration Setup states
   const [username, setUsername] = useState<string>(() => {
@@ -85,6 +141,10 @@ function App() {
   });
 
   const activeQuestion = questions[currentIndex];
+  
+  // Validation flags for Name
+  const isNameEmpty = username.trim() === '';
+  const isNameInvalid = containsProfanity(username);
 
   // Helper to update path & address history
   const navigateTo = (newPath: string) => {
@@ -97,6 +157,13 @@ function App() {
     const savedPath = window.location.pathname;
     const savedProgressStr = localStorage.getItem('twiquiz_progress');
     
+    if (savedPath === '/twi') {
+      setPath('/twi');
+      setQuizState('welcome');
+      fetchLeaderboard();
+      return;
+    }
+
     if (savedProgressStr) {
       try {
         const savedProgress = JSON.parse(savedProgressStr);
@@ -172,7 +239,7 @@ function App() {
         questionOrder
       };
       localStorage.setItem('twiquiz_progress', JSON.stringify(progress));
-    } else if (path === '/' || path === '/start-quiz') {
+    } else if (path === '/' || path === '/start-quiz' || path === '/twi') {
       localStorage.removeItem('twiquiz_progress');
     }
   }, [questions, currentIndex, userAnswers, checkedQuestions, questionStatus, quizState, path, username, selectedTopics, questionOrder]);
@@ -182,6 +249,12 @@ function App() {
     const handlePopState = () => {
       const activePath = window.location.pathname;
       setPath(activePath);
+      
+      if (activePath === '/twi') {
+        fetchLeaderboard();
+        setQuizState('welcome');
+        return;
+      }
       
       if (activePath === '/quiz') {
         const progressStr = localStorage.getItem('twiquiz_progress');
@@ -204,13 +277,80 @@ function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  // 5. Auto-fill selectedOptions when user navigates to a card
+  // 5. Fetch leaderboard score trigger when path becomes /twi
+  useEffect(() => {
+    if (path === '/twi') {
+      fetchLeaderboard();
+    }
+  }, [path]);
+
+  // 6. Auto-fill selectedOptions when user navigates to a card
   useEffect(() => {
     if (activeQuestion && path === '/quiz') {
       const previouslySelected = userAnswers[currentIndex];
       setSelectedOptions(previouslySelected || []);
     }
   }, [currentIndex, path, userAnswers, activeQuestion]);
+
+  // Fetch leaderboard statistics from Supabase REST API
+  const fetchLeaderboard = async () => {
+    if (SUPABASE_URL.includes("your-supabase-url") || SUPABASE_ANON_KEY.includes("your-anon-key")) {
+      setLeaderboardError('keys_not_set');
+      return;
+    }
+    
+    setIsLeaderboardLoading(true);
+    setLeaderboardError('');
+    try {
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/twiquiz_leaderboard?order=created_at.desc`, {
+        method: 'GET',
+        headers: {
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+        }
+      });
+      if (!res.ok) throw new Error(`Server returned code ${res.status}`);
+      const data = await res.json();
+      setLeaderboard(data || []);
+    } catch (err: any) {
+      console.error('Failed to load leaderboard data:', err);
+      setLeaderboardError(err.message || 'Failed to connect to Supabase database.');
+    } finally {
+      setIsLeaderboardLoading(false);
+    }
+  };
+
+  // Asynchronously save score to Supabase leaderboard
+  const saveScoreToLeaderboard = async (finalCorrect: number, finalTotal: number, finalPct: number) => {
+    if (SUPABASE_URL.includes("your-supabase-url") || SUPABASE_ANON_KEY.includes("your-anon-key")) {
+      console.log("Supabase placeholder detected. Leaderboard database save bypassed.");
+      return;
+    }
+
+    try {
+      await fetch(`${SUPABASE_URL}/rest/v1/twiquiz_leaderboard`, {
+        method: 'POST',
+        headers: {
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+          'Prefer': 'return=minimal'
+        },
+        body: JSON.stringify({
+          name: username.trim(),
+          score_percentage: finalPct,
+          correct_count: finalCorrect,
+          total_count: finalTotal,
+          topics: selectedTopics,
+          order_mode: questionOrder,
+          created_at: new Date().toISOString()
+        })
+      });
+      console.log("Score successfully logged to Supabase leaderboard!");
+    } catch (err) {
+      console.error("Failed to post score record to Supabase:", err);
+    }
+  };
 
   // Topic card toggle click
   const handleTopicToggle = (topic: string) => {
@@ -233,6 +373,8 @@ function App() {
 
   // Start quiz action
   const handleStartQuiz = () => {
+    if (isNameEmpty || isNameInvalid) return;
+
     // Filter questions by selected categories
     let filtered = defaultQuestions.filter(q => {
       const cat = q.category || 'General Pharmacology';
@@ -245,10 +387,8 @@ function App() {
 
     let finalQuestions: Question[] = [];
     if (questionOrder === 'sequenced') {
-      // Sort questions in ascending order of their original IDs, options in original order
       finalQuestions = [...filtered].sort((a, b) => a.id - b.id);
     } else {
-      // Shuffle questions and shuffle their options
       const shuffled = shuffleArray(filtered);
       finalQuestions = shuffled.map(q => ({
         ...q,
@@ -278,7 +418,6 @@ function App() {
   // Option selection click handler
   const handleOptionSelect = (option: string) => {
     if (!activeQuestion) return;
-    // Prevent selections if the question is already checked
     if (checkedQuestions[currentIndex]) return;
 
     const isMultiSelect = activeQuestion.answers.length > 1;
@@ -295,23 +434,20 @@ function App() {
     }
   };
 
-  // Action: Check Answer (Locks option state and reveals correctness inline)
+  // Action: Check Answer
   const handleCheckAnswer = () => {
     if (!activeQuestion || selectedOptions.length === 0) return;
 
-    // Save answer selection
     setUserAnswers(prev => ({
       ...prev,
       [currentIndex]: selectedOptions
     }));
 
-    // Record as checked
     setCheckedQuestions(prev => ({
       ...prev,
       [currentIndex]: true
     }));
 
-    // Update status to submitted
     setQuestionStatus(prev => ({
       ...prev,
       [currentIndex]: 'submitted'
@@ -324,12 +460,11 @@ function App() {
       setCurrentIndex(prev => prev + 1);
       setSelectedOptions([]);
     } else {
-      // Last card, trigger Finish Grade confirmation dialog
       setShowFinishModal(true);
     }
   };
 
-  // Action: Skip Question (Proceeds without inline correctness validation)
+  // Action: Skip Question
   const handleSkipQuestion = () => {
     if (!checkedQuestions[currentIndex]) {
       setQuestionStatus(prev => ({
@@ -364,11 +499,14 @@ function App() {
 
   // Action: Finish Quiz (Triggers completion report view)
   const handleGradeQuiz = () => {
+    const finalTotal = questions.length;
+    
     // Save selections on active question if skipped check
-    if (activeQuestion && selectedOptions.length > 0 && !checkedQuestions[currentIndex]) {
+    let activeSelected = selectedOptions;
+    if (activeQuestion && activeSelected.length > 0 && !checkedQuestions[currentIndex]) {
       setUserAnswers(prev => ({
         ...prev,
-        [currentIndex]: selectedOptions
+        [currentIndex]: activeSelected
       }));
       setCheckedQuestions(prev => ({
         ...prev,
@@ -378,8 +516,28 @@ function App() {
         ...prev,
         [currentIndex]: 'submitted'
       }));
+    } else {
+      activeSelected = userAnswers[currentIndex] || [];
     }
+
+    // Re-calculate correctness exactly to submit to cloud database immediately
+    let recalculatedCorrect = 0;
+    questions.forEach((q, idx) => {
+      let sel = userAnswers[idx];
+      if (idx === currentIndex && activeSelected.length > 0) {
+        sel = activeSelected;
+      }
+      sel = sel || [];
+      if (sel.length > 0 && areAnswersCorrect(sel, q.answers)) {
+        recalculatedCorrect += 1;
+      }
+    });
+
+    const recalculatedPercentage = finalTotal > 0 ? Math.round((recalculatedCorrect / finalTotal) * 100) : 0;
     
+    // Post to Supabase Leaderboard
+    saveScoreToLeaderboard(recalculatedCorrect, finalTotal, recalculatedPercentage);
+
     setShowFinishModal(false);
     setQuizState('completed');
   };
@@ -434,10 +592,20 @@ function App() {
   // 6. Global Keyboard Keybindings (Double-Enter checked sequence, M for review)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (path !== '/quiz' || quizState !== 'quiz' || showQuitModal || showFinishModal) return;
-
       const target = e.target as HTMLElement;
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
+      if (path === '/start-quiz') {
+        if (e.key === 'Enter') {
+          if (selectedTopics.length > 0 && !isNameEmpty && !isNameInvalid) {
+            e.preventDefault();
+            handleStartQuiz();
+          }
+        }
+        return;
+      }
+
+      if (path !== '/quiz' || quizState !== 'quiz' || showQuitModal || showFinishModal) return;
 
       const isChecked = checkedQuestions[currentIndex] === true;
 
@@ -458,7 +626,7 @@ function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [path, quizState, showQuitModal, showFinishModal, selectedOptions, currentIndex, checkedQuestions, questions]);
+  }, [path, quizState, showQuitModal, showFinishModal, selectedOptions, currentIndex, checkedQuestions, questions, selectedTopics, username]);
 
   return (
     <>
@@ -476,26 +644,48 @@ function App() {
           <span className="logo-text">TwiQuiz</span>
         </div>
         
-        {path === '/quiz' && quizState === 'quiz' && (
-          <div className="header-actions">
+        <div className="header-actions">
+          {path !== '/twi' && (
             <button 
               className="btn-secondary" 
-              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+              onClick={() => { setQuizState('welcome'); navigateTo('/twi'); }}
+              style={{ borderRadius: '8px', padding: '0.45rem 0.9rem', borderColor: 'var(--primary)' }}
+            >
+              🏆 Leaderboard
+            </button>
+          )}
+          
+          {path === '/twi' && (
+            <button 
+              className="btn-secondary" 
+              onClick={() => navigateTo('/')}
               style={{ borderRadius: '8px', padding: '0.45rem 0.9rem' }}
             >
-              {isSidebarOpen ? <X size={15} /> : <Menu size={15} />}
-              {isSidebarOpen ? 'Hide Nav' : 'Show Nav'}
+              🏠 Home
             </button>
-            <button 
-              className="btn-secondary" 
-              onClick={() => setShowQuitModal(true)}
-              style={{ borderColor: 'var(--error-border)', color: 'var(--error)', borderRadius: '8px', padding: '0.45rem 0.9rem' }}
-            >
-              <LogOut size={13} />
-              Quit Quiz
-            </button>
-          </div>
-        )}
+          )}
+
+          {path === '/quiz' && quizState === 'quiz' && (
+            <>
+              <button 
+                className="btn-secondary" 
+                onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+                style={{ borderRadius: '8px', padding: '0.45rem 0.9rem' }}
+              >
+                {isSidebarOpen ? <X size={15} /> : <Menu size={15} />}
+                {isSidebarOpen ? 'Hide Nav' : 'Show Nav'}
+              </button>
+              <button 
+                className="btn-secondary" 
+                onClick={() => setShowQuitModal(true)}
+                style={{ borderColor: 'var(--error-border)', color: 'var(--error)', borderRadius: '8px', padding: '0.45rem 0.9rem' }}
+              >
+                <LogOut size={13} />
+                Quit Quiz
+              </button>
+            </>
+          )}
+        </div>
       </header>
 
       {/* 2. APP VIEW GRID */}
@@ -511,15 +701,21 @@ function App() {
               <div className="badge">Knowledge Assessment Redefined</div>
               <h1 className="hero-title">TwiQuiz Platform</h1>
               <p className="hero-subtitle">
-                Welcome to TwiQuiz, a modern, minimalist assessment console designed by Twistark Technologies. 
+                Welcome to TwiQuiz, a modern, minimalist assessment console designed by Anand Kolte. 
                 Configure topic categories, select sequence options, and challenge yourself.
               </p>
 
-              <button className="btn-primary" onClick={() => navigateTo('/start-quiz')} style={{ marginTop: '0.5rem' }}>
-                <Play size={15} />
-                Configure Quiz Settings
-                <ArrowRight size={15} />
-              </button>
+              <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.5rem' }}>
+                <button className="btn-primary" onClick={() => navigateTo('/start-quiz')}>
+                  <Play size={15} />
+                  Configure Quiz Settings
+                  <ArrowRight size={15} />
+                </button>
+                
+                <button className="btn-secondary" onClick={() => navigateTo('/twi')} style={{ borderColor: 'var(--primary)' }}>
+                  View Live Leaderboard
+                </button>
+              </div>
 
               <div className="features-grid">
                 <div className="feature-item">
@@ -547,15 +743,23 @@ function App() {
               <h2 className="config-title">Configure your quiz run</h2>
               <p className="config-subtitle">Name, topic selection, sequenced or randomized order, and inline question count controls.</p>
               
-              {/* Name Input */}
+              {/* Name Input (MANDATORY AND SANITIZED WITH SLANG FILTER) */}
               <div className="name-input-group">
-                <label className="input-label">Your Name</label>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <label className="input-label">Your Name <span style={{ color: 'var(--error)' }}>*</span></label>
+                  {isNameInvalid && (
+                    <span className="badge" style={{ background: 'rgba(239, 68, 68, 0.1)', borderColor: 'rgba(239, 68, 68, 0.25)', color: 'var(--error)', fontSize: '0.68rem', textTransform: 'none', padding: '0.2rem 0.5rem' }}>
+                      Banned words/slangs are not allowed!
+                    </span>
+                  )}
+                </div>
                 <input 
                   type="text" 
                   className="name-input" 
-                  placeholder="Enter your name to begin" 
+                  placeholder="Enter your name to begin (Required)" 
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
+                  style={{ borderColor: isNameInvalid ? 'var(--error)' : BANNED_WORDS.some(w => username.toLowerCase().includes(w)) ? 'var(--error)' : '' }}
                 />
               </div>
 
@@ -622,7 +826,7 @@ function App() {
                         ? 'None selected' 
                         : selectedTopics.length === allTopics.length 
                           ? 'All Topics' 
-                          : `${selectedTopics.length} TopicsSelected`}
+                          : `${selectedTopics.length} Topics`}
                     </span>
                   </div>
                   <div className="setup-summary-col">
@@ -647,12 +851,20 @@ function App() {
                 <button 
                   className="btn-primary btn-cyan" 
                   onClick={handleStartQuiz}
-                  disabled={selectedTopics.length === 0}
+                  disabled={selectedTopics.length === 0 || isNameEmpty || isNameInvalid}
                   style={{ minWidth: '150px' }}
+                  title={(isNameEmpty) ? "Please enter your name to start" : (isNameInvalid) ? "Banned slang detected!" : "Start Quiz"}
                 >
                   <Play size={14} />
                   Start Quiz
                 </button>
+              </div>
+
+              {/* Keyboard Shortcuts Footer */}
+              <div className="keyboard-shortcuts-footer" style={{ marginTop: '1.25rem' }}>
+                <span className="shortcut-item">
+                  <kbd className="key-tag">Enter</kbd> <span>to start quiz</span>
+                </span>
               </div>
 
             </div>
@@ -834,6 +1046,17 @@ function App() {
                   </div>
                 </div>
 
+                {/* Keyboard Shortcuts Footer */}
+                <div className="keyboard-shortcuts-footer" style={{ marginTop: '1.25rem' }}>
+                  <span className="shortcut-item">
+                    <kbd className="key-tag">Enter</kbd> <span>to check answer & load next card</span>
+                  </span>
+                  <span className="shortcut-divider">•</span>
+                  <span className="shortcut-item">
+                    <kbd className="key-tag">M</kbd> <span>to toggle review status</span>
+                  </span>
+                </div>
+
               </div>
             </div>
           )}
@@ -954,7 +1177,7 @@ function App() {
                       </div>
 
                       <p className="feedback-desc" style={{ fontSize: '0.8rem', marginTop: '0.5rem', borderLeft: '2px solid rgba(255,255,255,0.05)', paddingLeft: '0.5rem', color: 'var(--text-secondary)' }}>
-                        <strong>Concept Concept:</strong> {question.explanation}
+                        <strong>Concept Explanation:</strong> {question.explanation}
                       </p>
                     </div>
                   );
@@ -975,6 +1198,204 @@ function App() {
                 }}>
                   <RotateCcw size={14} />
                   Configure New Run
+                </button>
+              </div>
+
+            </div>
+          )}
+
+          {/* DYNAMIC LEADERBOARD / DATABASE LOG RECORDS VIEW SCREEN (/twi) */}
+          {path === '/twi' && (
+            <div className="glass-card" style={{ animation: 'slideUp 0.4s ease-out', textAlign: 'left' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                <div>
+                  <h2 className="config-title" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                    🏆 TwiQuiz Leaderboard
+                  </h2>
+                  <p className="config-subtitle" style={{ marginBottom: 0 }}>Chronological history logs of student attempts synchronized from Supabase cloud database.</p>
+                </div>
+                
+                <button 
+                  className="btn-secondary" 
+                  onClick={fetchLeaderboard}
+                  disabled={isLeaderboardLoading}
+                  style={{ display: 'flex', alignItems: 'center', gap: '0.35rem', padding: '0.45rem 0.9rem' }}
+                >
+                  <RotateCcw size={13} className={isLeaderboardLoading ? 'spin-anim' : ''} />
+                  Refresh
+                </button>
+              </div>
+
+              {isLeaderboardLoading ? (
+                <div style={{ padding: '4rem 0', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem' }}>
+                  <div className="spin-loader"></div>
+                  <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>Connecting to database and reading records...</p>
+                </div>
+              ) : leaderboardError === 'keys_not_set' ? (
+                /* Keys not set warning box */
+                <div style={{
+                  background: 'rgba(139, 92, 246, 0.05)',
+                  border: '1px solid rgba(139, 92, 246, 0.15)',
+                  borderRadius: '12px',
+                  padding: '1.5rem',
+                  marginTop: '1rem',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '1rem'
+                }}>
+                  <div style={{ display: 'flex', gap: '0.75rem', color: 'var(--primary-hover)' }}>
+                    <HelpCircle size={32} style={{ flexShrink: 0 }} />
+                    <div>
+                      <h4 style={{ fontSize: '1rem', fontWeight: 700, color: 'white', marginBottom: '0.25rem' }}>Leaderboard is Ready for Connection!</h4>
+                      <p style={{ fontSize: '0.85rem', lineHeight: 1.45, color: 'var(--text-secondary)' }}>
+                        You have successfully activated the `/twi` leaderboards routing and display console! To start permanently saving student names and scores in the cloud, simply link your Supabase database:
+                      </p>
+                    </div>
+                  </div>
+
+                  <div style={{
+                    background: 'rgba(0,0,0,0.3)',
+                    borderRadius: '8px',
+                    padding: '1rem',
+                    fontFamily: 'monospace',
+                    fontSize: '0.78rem',
+                    color: '#c084fc',
+                    border: '1px solid var(--border-light)',
+                    lineHeight: 1.5
+                  }}>
+                    <span style={{ color: '#64748b' }}># 1. Create a table in your Supabase SQL Editor:</span>
+                    <br />
+                    create table twiquiz_leaderboard (
+                    <br />
+                    &nbsp;&nbsp;id bigint generated always as identity primary key,
+                    <br />
+                    &nbsp;&nbsp;name text not null,
+                    <br />
+                    &nbsp;&nbsp;score_percentage integer not null,
+                    <br />
+                    &nbsp;&nbsp;correct_count integer not null,
+                    <br />
+                    &nbsp;&nbsp;total_count integer not null,
+                    <br />
+                    &nbsp;&nbsp;topics text[] not null,
+                    <br />
+                    &nbsp;&nbsp;order_mode text not null,
+                    <br />
+                    &nbsp;&nbsp;created_at timestamp with time zone default timezone('utc'::text, now()) not null
+                    <br />
+                    );
+                  </div>
+
+                  <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.4 }}>
+                    <strong>Next Step:</strong> Paste your Supabase URL and Anon Key into the top configuration block of <code>src/App.tsx</code> (or add them inside a <code>.env</code> file as <code>VITE_SUPABASE_URL</code> and <code>VITE_SUPABASE_ANON_KEY</code>). Once connected, student scores will save and display here automatically!
+                  </p>
+                </div>
+              ) : leaderboardError ? (
+                <div style={{
+                  background: 'rgba(239, 68, 68, 0.05)',
+                  border: '1px solid rgba(239, 68, 68, 0.15)',
+                  borderRadius: '10px',
+                  padding: '1.25rem',
+                  color: 'var(--error)',
+                  fontSize: '0.85rem',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  marginTop: '1rem'
+                }}>
+                  <AlertTriangle size={16} />
+                  <span>Error: {leaderboardError}. Please verify your Supabase keys and table structure.</span>
+                </div>
+              ) : leaderboard.length === 0 ? (
+                <div style={{ padding: '3.5rem 0', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                  <p style={{ fontSize: '0.9rem', fontWeight: 600 }}>No quiz attempts logged yet.</p>
+                  <p style={{ fontSize: '0.78rem', marginTop: '0.25rem' }}>Be the first to complete a quiz and post your score!</p>
+                  <button className="btn-primary" onClick={() => navigateTo('/start-quiz')} style={{ marginTop: '1rem', padding: '0.5rem 1.25rem', fontSize: '0.82rem' }}>
+                    Configure & Start Quiz
+                  </button>
+                </div>
+              ) : (
+                /* Leaderboard Table Display */
+                <div style={{ overflowX: 'auto', marginTop: '1rem', border: '1px solid var(--border-light)', borderRadius: '10px', background: 'rgba(0,0,0,0.15)' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                    <thead>
+                      <tr style={{ background: 'rgba(255,255,255,0.02)', borderBottom: '1px solid var(--border-light)', color: 'var(--text-secondary)', textTransform: 'uppercase', fontSize: '0.72rem', letterSpacing: '0.5px' }}>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700 }}>Rank</th>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700 }}>Tester</th>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700, textAlign: 'center' }}>Score</th>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700, textAlign: 'center' }}>Accuracy</th>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700 }}>Topics Categories</th>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700 }}>Order</th>
+                        <th style={{ padding: '0.75rem 1rem', fontWeight: 700, textAlign: 'right' }}>Date</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {leaderboard.map((record, index) => {
+                        const date = new Date(record.created_at).toLocaleDateString(undefined, {
+                          month: 'short',
+                          day: 'numeric',
+                          hour: '2-digit',
+                          minute: '2-digit'
+                        });
+                        const topicsList = Array.isArray(record.topics) ? record.topics : [];
+                        const isHigh = record.score_percentage >= 80;
+                        const isMid = record.score_percentage >= 60 && record.score_percentage < 80;
+
+                        return (
+                          <tr key={record.id} style={{ borderBottom: '1px solid rgba(255,255,255,0.03)', transition: 'background 0.2s ease' }} className="leaderboard-row">
+                            <td style={{ padding: '0.75rem 1rem', fontWeight: 700, color: index === 0 ? 'var(--warning-gold)' : index === 1 ? '#cbd5e1' : index === 2 ? '#b45309' : 'var(--text-muted)' }}>
+                              #{index + 1}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', fontWeight: 600, color: 'white' }}>
+                              {record.name}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', textAlign: 'center', fontWeight: 600 }}>
+                              {record.correct_count} / {record.total_count}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', textAlign: 'center' }}>
+                              <span style={{
+                                padding: '0.2rem 0.5rem',
+                                borderRadius: '4px',
+                                fontSize: '0.75rem',
+                                fontWeight: 700,
+                                background: isHigh ? 'rgba(16, 185, 129, 0.1)' : isMid ? 'rgba(245, 158, 11, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                                color: isHigh ? 'var(--success)' : isMid ? 'var(--warning-gold)' : 'var(--error)',
+                                border: isHigh ? '1px solid rgba(16, 185, 129, 0.2)' : isMid ? '1px solid rgba(245, 158, 11, 0.2)' : '1px solid rgba(239, 68, 68, 0.2)'
+                              }}>
+                                {record.score_percentage}%
+                              </span>
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', color: 'var(--text-secondary)', maxWidth: '220px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={topicsList.join(', ')}>
+                              {topicsList.length === 0 ? 'None' : topicsList.length === allTopics.length ? 'All Topics' : topicsList.join(', ')}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', textTransform: 'capitalize', color: 'var(--text-muted)' }}>
+                              {record.order_mode}
+                            </td>
+                            <td style={{ padding: '0.75rem 1rem', textAlign: 'right', color: 'var(--text-secondary)' }}>
+                              {date}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Actions row */}
+              <div style={{ display: 'flex', gap: '0.65rem', justifyContent: 'flex-end', marginTop: '1.25rem' }}>
+                <button 
+                  className="btn-secondary" 
+                  onClick={() => navigateTo('/')}
+                >
+                  Back to Lobby
+                </button>
+                <button 
+                  className="btn-primary" 
+                  onClick={() => navigateTo('/start-quiz')}
+                >
+                  <Play size={14} />
+                  Configure & Start Quiz
                 </button>
               </div>
 
